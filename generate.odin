@@ -10,6 +10,7 @@ import sampler "sampler:sampler"
 import tokenizer "tokenizer:tokenizer"
 import tok35 "qwen3_5_tokenizer:qwen3_5_tokenizer"
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -62,27 +63,176 @@ detect_arch :: proc(path: string) -> Model_Kind {
 
 build_chat_prompt :: proc(
 	messages: []Chat_Message,
+	tools: []Tool_Def,
 	think: bool,
 	allocator := context.allocator,
 ) -> string {
 	b := strings.builder_make(allocator)
 	defer strings.builder_destroy(&b)
 
+	tools_section := ""
+	if len(tools) > 0 {
+		tools_section = build_tools_section(tools, allocator)
+	}
+	defer {
+		if len(tools_section) > 0 do delete(tools_section)
+	}
+
+	tools_injected := false
+
+	// If no system message exists, prepend a tools system message so tool
+	// definitions appear before the user's question (standard chat order).
+	has_system := false
+	if len(tools) > 0 {
+		for msg in messages {
+			if msg.role == "system" {
+				has_system = true
+				break
+			}
+		}
+		if !has_system {
+			fmt.sbprintf(&b, "<|im_start|>system\n%s<|im_end|>\n", tools_section)
+			tools_injected = true
+		}
+	}
+
 	for msg in messages {
 		switch msg.role {
 		case "system":
-			fmt.sbprintf(&b, "<|im_start|>system\n%s<|im_end|>\n", msg.content)
+			if len(tools) > 0 && !tools_injected {
+				fmt.sbprintf(&b, "<|im_start|>system\n%s%s<|im_end|>\n", msg.content, tools_section)
+				tools_injected = true
+			} else {
+				fmt.sbprintf(&b, "<|im_start|>system\n%s<|im_end|>\n", msg.content)
+			}
 		case "user":
 			fmt.sbprintf(&b, "<|im_start|>user\n%s<|im_end|>\n", msg.content)
 		case "assistant":
 			fmt.sbprintf(&b, "<|im_start|>assistant\n%s<|im_end|>\n", msg.content)
+		case "tool":
+			fmt.sbprintf(&b, "<|im_start|>tool\n%s<|im_end|>\n", msg.content)
 		}
 	}
+
+	if len(tools) > 0 && !tools_injected {
+		fmt.sbprintf(&b, "<|im_start|>system\n%s<|im_end|>\n", tools_section)
+	}
+
 	fmt.sbprint(&b, "<|im_start|>assistant\n")
 	if !think {
 		fmt.sbprint(&b, "<think>\n\n</think>\n")
 	}
 	return strings.clone(strings.to_string(b), allocator)
+}
+
+// build_tools_section renders tool definitions in the Qwen3/Ornith tool-calling
+// format. Appended to the system prompt so the model knows what tools exist and
+// how to invoke them via <tool_call> XML tags.
+build_tools_section :: proc(tools: []Tool_Def, allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+
+	fmt.sbprint(&b, "\n\n# Tools\n\n")
+	fmt.sbprint(&b, "You may call one or more functions to assist with the user query.\n\n")
+	fmt.sbprint(&b, "You are provided with function signatures within <tools></tools> XML tags:\n")
+	fmt.sbprint(&b, "<tools>\n")
+
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena, alignment = 64, block_allocator = allocator)
+	defer mem.dynamic_arena_destroy(&arena)
+	tmp := mem.dynamic_arena_allocator(&arena)
+
+	for tool in tools {
+		data, err := json.marshal(tool, allocator = tmp)
+		if err != nil {
+			continue
+		}
+		strings.write_string(&b, string(data))
+		strings.write_string(&b, "\n")
+	}
+
+	fmt.sbprint(&b, "</tools>\n\n")
+	fmt.sbprint(&b, "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n")
+	fmt.sbprint(&b, "<tool_call>\n")
+	strings.write_string(&b, "{\"name\": \"...\", \"arguments\": {...}}")
+	fmt.sbprint(&b, "\n</tool_call>")
+
+	return strings.clone(strings.to_string(b), allocator)
+}
+
+// extract_tool_calls scans model output for <tool_call>...</tool_call> blocks,
+// parses the JSON inside each one, and returns the clean text (everything
+// outside the blocks) plus the parsed tool call entries.
+extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []Tool_Call_Entry) {
+	open_tag := "<tool_call>"
+	close_tag := "</tool_call>"
+
+	clean_builder := strings.builder_make()
+	defer strings.builder_destroy(&clean_builder)
+
+	results := make([dynamic]Tool_Call_Entry)
+
+	remaining := text
+	call_index := 0
+	for {
+		open_pos := strings.index(remaining, open_tag)
+		if open_pos < 0 {
+			strings.write_string(&clean_builder, remaining)
+			break
+		}
+		strings.write_string(&clean_builder, remaining[:open_pos])
+
+		after_open := open_pos + len(open_tag)
+		rest := remaining[after_open:]
+		close_pos := strings.index(rest, close_tag)
+		if close_pos < 0 {
+			strings.write_string(&clean_builder, remaining[open_pos:])
+			break
+		}
+
+		json_str := strings.trim_space(rest[:close_pos])
+
+		parsed: struct {
+			name:      string     `json:"name"`,
+			arguments: json.Value `json:"arguments"`,
+		}
+		if err := json.unmarshal_string(json_str, &parsed); err == nil {
+			args: json.Value = parsed.arguments
+			if args == nil {
+				args = json.Value(json.Object{})
+			}
+			append(&results, Tool_Call_Entry{
+				index = call_index,
+				id = fmt.tprintf("call_%d", call_index),
+				function = Tool_Call_Function{
+					name = parsed.name,
+					arguments = args,
+				},
+			})
+			call_index += 1
+		}
+
+		remaining = rest[close_pos + len(close_tag):]
+	}
+
+	clean_text = strings.clone(strings.to_string(clean_builder))
+	if len(results) > 0 {
+		return clean_text, results[:]
+	}
+	delete(results)
+	return clean_text, nil
+}
+
+// free_tool_calls frees the heap-owned fields of a []Tool_Call_Entry returned by
+// extract_tool_calls. Safe to call with nil.
+free_tool_calls :: proc(tool_calls: []Tool_Call_Entry) {
+	if len(tool_calls) == 0 do return
+	for tc in tool_calls {
+		delete(tc.id)
+		delete(tc.function.name)
+		json.destroy_value(tc.function.arguments)
+	}
+	delete(tool_calls)
 }
 
 generate_tokens :: proc(

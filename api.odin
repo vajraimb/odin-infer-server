@@ -11,8 +11,31 @@ import "core:strings"
 import "core:time"
 
 Chat_Message :: struct {
-	role:    string `json:"role"`,
-	content: string `json:"content"`,
+	role:       string            `json:"role"`,
+	content:    string            `json:"content,omitempty"`,
+	tool_calls: []Tool_Call_Entry `json:"tool_calls,omitempty"`,
+}
+
+Tool_Function :: struct {
+	name:        string     `json:"name"`,
+	description: string     `json:"description"`,
+	parameters:  json.Value `json:"parameters"`,
+}
+
+Tool_Def :: struct {
+	type:     string        `json:"type"`,
+	function: Tool_Function `json:"function"`,
+}
+
+Tool_Call_Function :: struct {
+	name:      string     `json:"name"`,
+	arguments: json.Value `json:"arguments"`,
+}
+
+Tool_Call_Entry :: struct {
+	index:    int                `json:"index"`,
+	id:       string             `json:"id"`,
+	function: Tool_Call_Function `json:"function"`,
 }
 
 Generate_Options :: struct {
@@ -33,6 +56,7 @@ Chat_Request :: struct {
 	model:    string           `json:"model"`,
 	messages: []Chat_Message   `json:"messages"`,
 	stream:   bool             `json:"stream"`,
+	tools:    []Tool_Def       `json:"tools,omitempty"`,
 	options:  Generate_Options `json:"options"`,
 }
 
@@ -50,6 +74,7 @@ Chat_Response :: struct {
 	created_at:        string       `json:"created_at"`,
 	message:           Chat_Message `json:"message,omitempty"`,
 	done:              bool         `json:"done"`,
+	done_reason:       string       `json:"done_reason,omitempty"`,
 	prompt_eval_count: int          `json:"prompt_eval_count,omitempty"`,
 	eval_count:        int          `json:"eval_count,omitempty"`,
 }
@@ -100,8 +125,10 @@ parse_gen_options :: proc(req_options: Generate_Options, defaults: Gen_Options) 
 }
 
 Stream_Writer :: struct {
-	sock:  net.TCP_Socket,
-	model: string,
+	sock:        net.TCP_Socket,
+	model:       string,
+	tool_calls:  []Tool_Call_Entry,
+	done_reason: string,
 }
 
 stream_write_chunk :: proc(chunk: string, done: bool, user_data: rawptr) {
@@ -123,8 +150,15 @@ stream_write_chat_chunk :: proc(chunk: string, done: bool, user_data: rawptr) {
 	resp.created_at = now_rfc3339()
 	resp.message = Chat_Message{role = "assistant", content = chunk}
 	resp.done = done
+	if done {
+		resp.done_reason = w.done_reason
+		if len(w.tool_calls) > 0 {
+			resp.message.tool_calls = w.tool_calls
+		}
+	}
 	if body, ok := json_marshal(resp); ok {
 		http_write_ndjson(w.sock, body)
+		delete(body)
 	}
 }
 
@@ -199,7 +233,14 @@ handle_chat :: proc(state: ^Gen_State, body: string, sock: net.TCP_Socket) {
 		return
 	}
 
-	prompt := build_chat_prompt(req.messages, false)
+	defer {
+		for t in req.tools {
+			json.destroy_value(t.function.parameters)
+		}
+		if req.tools != nil do delete(req.tools)
+	}
+
+	prompt := build_chat_prompt(req.messages, req.tools, false)
 	defer delete(prompt)
 
 	opts := parse_gen_options(req.options, Gen_Options{
@@ -208,22 +249,46 @@ handle_chat :: proc(state: ^Gen_State, body: string, sock: net.TCP_Socket) {
 		max_tokens  = 256,
 	})
 
+	has_tools := len(req.tools) > 0
+
 	if req.stream {
 		http_respond_headers(sock, 200, "application/x-ndjson")
-		writer := Stream_Writer{sock = sock, model = state.model_name}
-		text, n_prompt, n_gen, ok := generate_tokens(
-			state,
-			prompt,
-			opts,
-			stream_write_chat_chunk,
-			&writer,
-		)
-		delete(text)
-		if !ok {
-			http_write_ndjson(sock, `{"error":"generation failed"}`)
+
+		if has_tools {
+			text, _, _, gen_ok := generate_tokens(state, prompt, opts)
+			if !gen_ok {
+				http_write_ndjson(sock, `{"error":"generation failed"}`)
+				return
+			}
+			clean_text, tool_calls := extract_tool_calls(text)
+			delete(text)
+
+			writer := Stream_Writer{
+				sock        = sock,
+				model       = state.model_name,
+				tool_calls  = tool_calls,
+				done_reason = len(tool_calls) > 0 ? "tool_calls" : "stop",
+			}
+			if len(clean_text) > 0 {
+				stream_write_chat_chunk(clean_text, false, &writer)
+			}
+			stream_write_chat_chunk("", true, &writer)
+
+			delete(clean_text)
+			free_tool_calls(tool_calls)
 		} else {
-			_ = n_prompt
-			_ = n_gen
+			writer := Stream_Writer{sock = sock, model = state.model_name, done_reason = "stop"}
+			text, _, _, gen_ok := generate_tokens(
+				state,
+				prompt,
+				opts,
+				stream_write_chat_chunk,
+				&writer,
+			)
+			delete(text)
+			if !gen_ok {
+				http_write_ndjson(sock, `{"error":"generation failed"}`)
+			}
 		}
 		return
 	}
@@ -233,22 +298,38 @@ handle_chat :: proc(state: ^Gen_State, body: string, sock: net.TCP_Socket) {
 		http_respond(sock, 500, "application/json", `{"error":"generation failed"}`)
 		return
 	}
-	defer delete(text)
 
+	clean_text := text
+	tool_calls: []Tool_Call_Entry = nil
+	if has_tools {
+		clean_text, tool_calls = extract_tool_calls(text)
+		delete(text)
+	}
+
+	done_reason := len(tool_calls) > 0 ? "tool_calls" : "stop"
 	resp := Chat_Response{
-		model             = state.model_name,
-		created_at        = now_rfc3339(),
-		message           = Chat_Message{role = "assistant", content = text},
+		model      = state.model_name,
+		created_at = now_rfc3339(),
+		message = Chat_Message{
+			role       = "assistant",
+			content    = clean_text,
+			tool_calls = tool_calls,
+		},
 		done              = true,
+		done_reason       = done_reason,
 		prompt_eval_count = n_prompt,
 		eval_count        = n_gen,
 	}
+
 	if body_json, ok2 := json_marshal(resp); ok2 {
 		http_respond(sock, 200, "application/json", body_json)
 		delete(body_json)
 	} else {
 		http_respond(sock, 500, "application/json", `{"error":"marshal failed"}`)
 	}
+
+	delete(clean_text)
+	free_tool_calls(tool_calls)
 }
 
 handle_tags :: proc(state: ^Gen_State, sock: net.TCP_Socket) {
