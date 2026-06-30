@@ -39,10 +39,21 @@ Gen_State :: struct {
 	mu:           ^sync.Mutex,
 	model_name:   string,
 	model_path:   string,
-	rep_penalty:  f32, // server-wide repetition penalty (1.0 = off)
+	rep_penalty:  f32,            // server-wide repetition penalty (1.0 = off)
+	cache_tokens: [dynamic]int,   // token ids currently loaded into engine state (prompt + generated)
+	cache_len:    int,            // valid prefix length in cache_tokens (== positions filled)
 }
 
 Stream_Callback :: #type proc(chunk: string, done: bool, user_data: rawptr)
+
+// Length of the leading token-identical prefix between two sequences.
+common_prefix_len :: proc(a: []int, b: []int) -> int {
+	n := min(len(a), len(b))
+	for i in 0 ..< n {
+		if a[i] != b[i] do return i
+	}
+	return n
+}
 
 time_in_ms :: proc() -> i64 {
 	return time.to_unix_nanoseconds(time.now()) / 1_000_000
@@ -108,7 +119,16 @@ build_chat_prompt :: proc(
 		case "user":
 			fmt.sbprintf(&b, "<|im_start|>user\n%s<|im_end|>\n", msg.content)
 		case "assistant":
-			fmt.sbprintf(&b, "<|im_start|>assistant\n%s<|im_end|>\n", msg.content)
+			// Reconstruct past assistant turns the same way they were generated:
+			// when think is off, an empty <think></think> block was injected
+			// before the model's answer, so it must be present here too -- this
+			// keeps the token sequence identical across turns and lets the
+			// prefix cache hit (otherwise every turn diverges and resets).
+			if !think {
+				fmt.sbprintf(&b, "<|im_start|>assistant\n<think>\n\n</think>\n%s<|im_end|>\n", msg.content)
+			} else {
+				fmt.sbprintf(&b, "<|im_start|>assistant\n%s<|im_end|>\n", msg.content)
+			}
 		case "tool":
 			fmt.sbprintf(&b, "<|im_start|>tool\n%s<|im_end|>\n", msg.content)
 		}
@@ -290,6 +310,35 @@ generate_tokens :: proc(
 	}
 
 	num_prompt := len(prompt_ids)
+
+	// ---- prefix caching: resume from the longest point the engine state allows ----
+	// The engine's evolving state (KV cache + conv/recurrent state) is kept
+	// between requests. Find how much of the new prompt is already loaded and
+	// only prefill the rest. For agent multi-turn (each turn extends the last)
+	// this turns O(history) prefill into O(new tokens).
+	cache := state.cache_tokens[:state.cache_len]
+	L := common_prefix_len(cache, prompt_ids)
+	resume_at: int
+	if state.kind == .Qwen3_5 {
+		// Gated-delta recurrent state is not rewindable: only safe to resume if
+		// the new prompt extends the cache exactly (L == cache_len). Otherwise
+		// reset and recompute from scratch.
+		if L == state.cache_len && L > 0 {
+			resume_at = L
+		} else {
+			resume_at = 0
+			if state.cache_len > 0 {
+				q35.engine_reset_state(state.engine_q35)
+				state.cache_len = 0
+			}
+		}
+	} else {
+		// Qwen3 KV cache is random-access: resume at the common-prefix length;
+		// stale slots beyond L get overwritten as we prefill.
+		resume_at = L
+	}
+	if resume_at > num_prompt do resume_at = num_prompt
+
 	max_gen := opts.max_tokens
 	if max_gen <= 0 {
 		max_gen = seq_len - num_prompt
@@ -298,36 +347,34 @@ generate_tokens :: proc(
 
 	eos := state.kind == .Qwen3_5 ? EOS_QWEN3_5 : EOS_QWEN3
 
-	pos := 0
+	pos := resume_at
 	next := 0
 	gen_count := 0
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
+	gen_ids: [dynamic]int
+	defer delete(gen_ids)
 
-	for {
-		token: int
-		if pos < num_prompt {
-			token = prompt_ids[pos]
-		} else {
-			token = next
-		}
-
+	// prefill the tail [resume_at .. num_prompt)
+	for pos < num_prompt {
 		if pos >= seq_len do break
-
 		logits: []f32
 		if state.kind == .Qwen3_5 {
-			logits = q35.engine_forward(state.engine_q35, token, pos)
+			logits = q35.engine_forward(state.engine_q35, prompt_ids[pos], pos)
 		} else {
-			logits = infer.engine_forward(state.engine_q3, token, pos)
+			logits = infer.engine_forward(state.engine_q3, prompt_ids[pos], pos)
 		}
 		next = sampler.sample(&samp, logits)
 		pos += 1
+	}
 
-		if pos < num_prompt do continue
-
+	// generation
+	for {
+		if pos >= seq_len do break
 		if next == eos do break
 		if gen_count >= max_gen do break
 
+		append(&gen_ids, next)
 		piece: string
 		if state.kind == .Qwen3_5 {
 			piece = tok35.decode_token_id(state.tok_q35, next)
@@ -345,11 +392,27 @@ generate_tokens :: proc(
 			sampler.record_token(&samp, next)
 		}
 		gen_count += 1
+
+		logits: []f32
+		if state.kind == .Qwen3_5 {
+			logits = q35.engine_forward(state.engine_q35, next, pos)
+		} else {
+			logits = infer.engine_forward(state.engine_q3, next, pos)
+		}
+		next = sampler.sample(&samp, logits)
+		pos += 1
 	}
 
 	if stream != nil {
 		stream("", true, stream_user)
 	}
+
+	// update cache: cache_tokens = prompt_ids + generated ids, so the next
+	// request that extends this conversation can resume from pos.
+	clear(&state.cache_tokens)
+	append(&state.cache_tokens, ..prompt_ids)
+	append(&state.cache_tokens, ..gen_ids[:])
+	state.cache_len = pos
 
 	return strings.clone(strings.to_string(builder)), num_prompt, gen_count, true
 }

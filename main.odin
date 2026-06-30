@@ -114,6 +114,8 @@ main :: proc() {
 		model_name = model_name,
 		rep_penalty = rep_penalty,
 	}
+	state.cache_tokens = make([dynamic]int, 0, 4096)
+	defer delete(state.cache_tokens)
 	state.model_path = strings.clone(model_path)
 	defer delete(state.model_path)
 
