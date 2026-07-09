@@ -354,19 +354,34 @@ generate_tokens :: proc(
 	defer strings.builder_destroy(&builder)
 	gen_ids: [dynamic]int
 	defer delete(gen_ids)
+	t0 := time_in_ms()
 
-	// prefill the tail [resume_at .. num_prompt)
-	for pos < num_prompt {
-		if pos >= seq_len do break
-		logits: []f32
-		if state.kind == .Qwen3_5 {
-			logits = q35.engine_forward(state.engine_q35, prompt_ids[pos], pos)
-		} else {
-			logits = infer.engine_forward(state.engine_q3, prompt_ids[pos], pos)
+	// prefill the tail [resume_at .. num_prompt). Qwen3.5 uses the batched MMQ
+	// path (Stage 1b: all projections batched); Qwen3 stays per-token. The last
+	// new token runs per-token so its sampled `next` is the first generated
+	// token (same semantics as the old per-token loop).
+	if state.kind == .Qwen3_5 {
+		to_prefill := prompt_ids[resume_at:num_prompt]
+		nt := len(to_prefill)
+		if nt > 1 {
+			q35.engine_forward_batch(state.engine_q35, to_prefill[:nt - 1], resume_at)
+			logits := q35.engine_forward(state.engine_q35, to_prefill[nt - 1], resume_at + nt - 1)
+			next = sampler.sample(&samp, logits)
+			pos = num_prompt
+		} else if nt == 1 {
+			logits := q35.engine_forward(state.engine_q35, to_prefill[0], resume_at)
+			next = sampler.sample(&samp, logits)
+			pos = num_prompt
 		}
-		next = sampler.sample(&samp, logits)
-		pos += 1
+	} else {
+		for pos < num_prompt {
+			if pos >= seq_len do break
+			logits := infer.engine_forward(state.engine_q3, prompt_ids[pos], pos)
+			next = sampler.sample(&samp, logits)
+			pos += 1
+		}
 	}
+	t_prefill := time_in_ms() - t0
 
 	// generation
 	for {
@@ -406,6 +421,13 @@ generate_tokens :: proc(
 	if stream != nil {
 		stream("", true, stream_user)
 	}
+	t_gen := time_in_ms() - t0 - t_prefill
+
+	// per-request diagnostics on stderr: shows cache-hit point + where time goes
+	fmt.eprintf(
+		"[gen] prompt=%d resume=@%d (cached %d) new_prefill=%d gen=%d  %dms/%dms\n",
+		num_prompt, resume_at, resume_at, num_prompt - resume_at, gen_count, t_prefill, t_gen,
+	)
 
 	// update cache: cache_tokens = prompt_ids + generated ids, so the next
 	// request that extends this conversation can resume from pos.
