@@ -130,7 +130,9 @@ build_chat_prompt :: proc(
 				fmt.sbprintf(&b, "<|im_start|>assistant\n%s<|im_end|>\n", msg.content)
 			}
 		case "tool":
-			fmt.sbprintf(&b, "<|im_start|>tool\n%s<|im_end|>\n", msg.content)
+			// Ornith/Qwen3.5 chat template wraps tool results in <tool_response>
+			// inside a user turn, not a separate "tool" role turn.
+			fmt.sbprintf(&b, "<|im_start|>user\n<tool_response>\n%s\n</tool_response><|im_end|>\n", msg.content)
 		}
 	}
 
@@ -172,17 +174,15 @@ build_tools_section :: proc(tools: []Tool_Def, allocator := context.allocator) -
 	}
 
 	fmt.sbprint(&b, "</tools>\n\n")
-	fmt.sbprint(&b, "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n")
-	fmt.sbprint(&b, "<tool_call>\n")
-	strings.write_string(&b, "{\"name\": \"...\", \"arguments\": {...}}")
-	fmt.sbprint(&b, "\n</tool_call>")
+	fmt.sbprint(&b, "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n")
+	fmt.sbprint(&b, "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>")
 
 	return strings.clone(strings.to_string(b), allocator)
 }
 
 // extract_tool_calls scans model output for <tool_call>...</tool_call> blocks,
-// parses the JSON inside each one, and returns the clean text (everything
-// outside the blocks) plus the parsed tool call entries.
+// parses each block (XML format <function=...><parameter=...> or JSON fallback),
+// and returns the clean text plus parsed tool call entries.
 extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []Tool_Call_Entry) {
 	open_tag := "<tool_call>"
 	close_tag := "</tool_call>"
@@ -210,26 +210,41 @@ extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []T
 			break
 		}
 
-		json_str := strings.trim_space(rest[:close_pos])
+		content := strings.trim_space(rest[:close_pos])
 
-		parsed: struct {
-			name:      string     `json:"name"`,
-			arguments: json.Value `json:"arguments"`,
-		}
-		if err := json.unmarshal_string(json_str, &parsed); err == nil {
-			args: json.Value = parsed.arguments
-			if args == nil {
-				args = json.Value(json.Object{})
-			}
+		// Try XML format first: <function=NAME>...<parameter=KEY>VALUE</parameter>...</function>
+		name, args, xml_ok := parse_xml_tool_call(content)
+		if xml_ok {
 			append(&results, Tool_Call_Entry{
 				index = call_index,
 				id = fmt.tprintf("call_%d", call_index),
 				function = Tool_Call_Function{
-					name = parsed.name,
+					name = name,
 					arguments = args,
 				},
 			})
 			call_index += 1
+		} else {
+			// Fallback: JSON format {"name": "...", "arguments": {...}}
+			parsed: struct {
+				name:      string     `json:"name"`,
+				arguments: json.Value `json:"arguments"`,
+			}
+			if err := json.unmarshal_string(content, &parsed); err == nil {
+				args2: json.Value = parsed.arguments
+				if args2 == nil {
+					args2 = json.Value(json.Object{})
+				}
+				append(&results, Tool_Call_Entry{
+					index = call_index,
+					id = fmt.tprintf("call_%d", call_index),
+					function = Tool_Call_Function{
+						name = parsed.name,
+						arguments = args2,
+					},
+				})
+				call_index += 1
+			}
 		}
 
 		remaining = rest[close_pos + len(close_tag):]
@@ -241,6 +256,48 @@ extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []T
 	}
 	delete(results)
 	return clean_text, nil
+}
+
+// Parse XML-format tool call content:
+//   <function=NAME>
+//   <parameter=KEY>
+//   VALUE
+//   </parameter>
+//   </function>
+// Returns (name, arguments as json.Object, ok). All strings are cloned so they
+// outlive the input buffer.
+parse_xml_tool_call :: proc(content: string) -> (name: string, args: json.Value, ok: bool) {
+	func_tag := "<function="
+	idx := strings.index(content, func_tag)
+	if idx < 0 do return "", nil, false
+
+	name_start := idx + len(func_tag)
+	name_end := strings.index(content[name_start:], ">")
+	if name_end < 0 do return "", nil, false
+	name = strings.clone(strings.trim_space(content[name_start : name_start + name_end]))
+
+	obj := make(json.Object)
+	param_tag := "<parameter="
+	scan := content[name_start + name_end + 1:]
+	for {
+		p_idx := strings.index(scan, param_tag)
+		if p_idx < 0 do break
+		key_start := p_idx + len(param_tag)
+		key_end := strings.index(scan[key_start:], ">")
+		if key_end < 0 do break
+		key := strings.clone(strings.trim_space(scan[key_start : key_start + key_end]))
+
+		val_start := key_start + key_end + 1
+		val_end := strings.index(scan[val_start:], "</parameter>")
+		if val_end < 0 do break
+		val := strings.clone(strings.trim_space(scan[val_start : val_start + val_end]))
+
+		obj[key] = json.Value(val)
+		scan = scan[val_start + val_end + len("</parameter>"):]
+	}
+
+	args = json.Value(obj)
+	return name, args, true
 }
 
 // free_tool_calls frees the heap-owned fields of a []Tool_Call_Entry returned by
@@ -384,6 +441,8 @@ generate_tokens :: proc(
 	t_prefill := time_in_ms() - t0
 
 	// generation
+	utf8_buf: [dynamic]u8  // buffers incomplete UTF-8 from multi-byte tokens
+	defer delete(utf8_buf)
 	for {
 		if pos >= seq_len do break
 		if next == eos do break
@@ -397,10 +456,27 @@ generate_tokens :: proc(
 			piece = tokenizer.decode_token_id(state.tok_q3, next)
 		}
 		if len(piece) > 0 {
-			if stream != nil {
-				stream(piece, false, stream_user)
-			}
 			strings.write_string(&builder, piece)
+			if stream != nil {
+				// Buffer decoded bytes and only emit complete UTF-8 characters.
+				// A single emoji token may produce partial bytes (e.g. \xf0\x9f)
+				// that aren't valid UTF-8 on their own; json.marshal would escape
+				// them as \xNN (invalid JSON). Holding them until the next token
+				// completes the sequence fixes streaming emoji.
+				// NOTE: must use transmute([]u8) — `for c in string` iterates
+				// runes (codepoints), not bytes, and u8(c) would truncate.
+				raw_bytes := transmute([]u8)piece
+				for b in raw_bytes do append(&utf8_buf, b)
+				emit_len := valid_utf8_prefix_len(utf8_buf[:])
+				if emit_len > 0 {
+					stream(string(utf8_buf[:emit_len]), false, stream_user)
+					remaining := len(utf8_buf) - emit_len
+					if remaining > 0 {
+						copy(utf8_buf[:remaining], utf8_buf[emit_len:])
+					}
+					resize(&utf8_buf, remaining)
+				}
+			}
 		}
 		delete(piece)
 		if rep > 1.0 {
@@ -418,6 +494,10 @@ generate_tokens :: proc(
 		pos += 1
 	}
 
+	// flush any remaining buffered bytes (should always be complete UTF-8 at EOS)
+	if stream != nil && len(utf8_buf) > 0 {
+		stream(string(utf8_buf[:]), false, stream_user)
+	}
 	if stream != nil {
 		stream("", true, stream_user)
 	}
@@ -437,4 +517,35 @@ generate_tokens :: proc(
 	state.cache_len = pos
 
 	return strings.clone(strings.to_string(builder)), num_prompt, gen_count, true
+}
+
+// Returns the length (in bytes) of the longest valid UTF-8 prefix of buf.
+// Incomplete trailing sequences (e.g. the first 2 bytes of a 4-byte emoji) are
+// excluded so the caller can buffer them for the next token.
+valid_utf8_prefix_len :: proc(buf: []u8) -> int {
+	i := 0
+	for i < len(buf) {
+		b := buf[i]
+		if b < 0x80 {
+			i += 1
+		} else if b < 0xC0 {
+			break // stray continuation byte
+		} else if b < 0xE0 {
+			if i + 2 > len(buf) do break
+			if buf[i + 1] & 0xC0 != 0x80 do break
+			i += 2
+		} else if b < 0xF0 {
+			if i + 3 > len(buf) do break
+			if buf[i + 1] & 0xC0 != 0x80 do break
+			if buf[i + 2] & 0xC0 != 0x80 do break
+			i += 3
+		} else {
+			if i + 4 > len(buf) do break
+			if buf[i + 1] & 0xC0 != 0x80 do break
+			if buf[i + 2] & 0xC0 != 0x80 do break
+			if buf[i + 3] & 0xC0 != 0x80 do break
+			i += 4
+		}
+	}
+	return i
 }
