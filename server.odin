@@ -126,6 +126,8 @@ route_request :: proc(state: ^Gen_State, req: ^HTTP_Request, sock: net.TCP_Socke
 			handle_tags(state, sock)
 		case "/api/version":
 			handle_version(sock)
+		case "/v1/models":
+			handle_v1_models(state, sock)
 		case "/health":
 			handle_health(sock)
 		case:
@@ -137,6 +139,10 @@ route_request :: proc(state: ^Gen_State, req: ^HTTP_Request, sock: net.TCP_Socke
 			handle_generate(state, req.body, sock)
 		case "/api/chat":
 			handle_chat(state, req.body, sock)
+		case "/api/show":
+			handle_show(state, sock)
+		case "/v1/chat/completions":
+			handle_v1_chat(state, req.body, sock)
 		case:
 			http_respond(sock, 404, "application/json", `{"error":"not found"}`)
 		}

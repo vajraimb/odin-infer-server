@@ -366,6 +366,60 @@ handle_version :: proc(sock: net.TCP_Socket) {
 	}
 }
 
+// Minimal /api/show so Ollama clients (openfang, etc.) can verify the model exists.
+Show_Details :: struct {
+	family:            string `json:"family"`,
+	parameter_size:    string `json:"parameter_size"`,
+	quantization_level: string `json:"quantization_level"`,
+}
+
+Show_Response :: struct {
+	license:   string       `json:"license"`,
+	modelfile: string       `json:"modelfile"`,
+	details:   Show_Details `json:"details"`,
+}
+
+handle_show :: proc(state: ^Gen_State, sock: net.TCP_Socket) {
+	resp := Show_Response{
+		license = "MIT",
+		modelfile = fmt.tprintf("FROM %s", state.model_name),
+		details = {family = "qwen3", parameter_size = "9B", quantization_level = "Q4_K"},
+	}
+	if body, ok := json_marshal(resp); ok {
+		http_respond(sock, 200, "application/json", body)
+		delete(body)
+	} else {
+		http_respond(sock, 500, "application/json", `{"error":"marshal failed"}`)
+	}
+}
+
+// OpenAI-compatible /v1/models list.
+V1_Model :: struct {
+	id:       string `json:"id"`,
+	object:   string `json:"object"`,
+	owned_by: string `json:"owned_by"`,
+}
+
+V1_Models_Response :: struct {
+	object: string     `json:"object"`,
+	data:   []V1_Model `json:"data"`,
+}
+
+handle_v1_models :: proc(state: ^Gen_State, sock: net.TCP_Socket) {
+	resp := V1_Models_Response{
+		object = "list",
+		data = {
+			V1_Model{id = state.model_name, object = "model", owned_by = "odin-infer"},
+		},
+	}
+	if body, ok := json_marshal(resp); ok {
+		http_respond(sock, 200, "application/json", body)
+		delete(body)
+	} else {
+		http_respond(sock, 500, "application/json", `{"error":"marshal failed"}`)
+	}
+}
+
 handle_root :: proc(state: ^Gen_State, sock: net.TCP_Socket) {
 	body := fmt.tprintf(
 		"odin-infer-server\nmodel: %s\nendpoints: GET /api/tags, GET /api/version, POST /api/generate, POST /api/chat\n",
@@ -389,4 +443,79 @@ parse_content_length :: proc(headers: string) -> int {
 		}
 	}
 	return 0
+}
+
+// ===== OpenAI-compatible /v1/chat/completions =====
+
+V1_Chat_Request :: struct {
+	model:       string         `json:"model"`,
+	messages:    []Chat_Message `json:"messages"`,
+	stream:      bool           `json:"stream"`,
+	tools:       []Tool_Def     `json:"tools,omitempty"`,
+	temperature: f32            `json:"temperature"`,
+	top_p:       f32            `json:"top_p"`,
+	max_tokens:  int            `json:"max_tokens"`,
+}
+
+V1_Choice :: struct {
+	index:         int          `json:"index"`,
+	message:       Chat_Message `json:"message"`,
+	finish_reason: string       `json:"finish_reason"`,
+}
+
+V1_Usage :: struct {
+	prompt_tokens:     int `json:"prompt_tokens"`,
+	completion_tokens: int `json:"completion_tokens"`,
+	total_tokens:      int `json:"total_tokens"`,
+}
+
+V1_Chat_Response :: struct {
+	id:      string      `json:"id"`,
+	object:  string      `json:"object"`,
+	model:   string      `json:"model"`,
+	choices: []V1_Choice `json:"choices"`,
+	usage:   V1_Usage    `json:"usage"`,
+}
+
+handle_v1_chat :: proc(state: ^Gen_State, body: string, sock: net.TCP_Socket) {
+	req: V1_Chat_Request
+	if err := json.unmarshal(transmute([]u8)body, &req); err != nil {
+		http_respond(sock, 400, "application/json", `{"error":{"message":"invalid JSON","type":"invalid_request_error"}}`)
+		return
+	}
+	if len(req.messages) == 0 {
+		http_respond(sock, 400, "application/json", `{"error":{"message":"messages required","type":"invalid_request_error"}}`)
+		return
+	}
+
+	temp := req.temperature > 0 ? req.temperature : 0.6
+	topp := req.top_p > 0 ? req.top_p : 0.95
+	max_tok := req.max_tokens > 0 ? req.max_tokens : 256
+
+	prompt := build_chat_prompt(req.messages, req.tools, false)
+	defer delete(prompt)
+
+	opts := Gen_Options{temperature = temp, top_p = topp, max_tokens = max_tok}
+	text, n_prompt, n_gen, ok := generate_tokens(state, prompt, opts)
+	if !ok {
+		http_respond(sock, 500, "application/json", `{"error":{"message":"generation failed","type":"server_error"}}`)
+		return
+	}
+	defer delete(text)
+
+	resp := V1_Chat_Response{
+		id = "chatcmpl-local",
+		object = "chat.completion",
+		model = state.model_name,
+		choices = {
+			V1_Choice{index = 0, message = {role = "assistant", content = text}, finish_reason = "stop"},
+		},
+		usage = {prompt_tokens = n_prompt, completion_tokens = n_gen, total_tokens = n_prompt + n_gen},
+	}
+	if body_json, ok2 := json_marshal(resp); ok2 {
+		http_respond(sock, 200, "application/json", body_json)
+		delete(body_json)
+	} else {
+		http_respond(sock, 500, "application/json", `{"error":{"message":"marshal failed","type":"server_error"}}`)
+	}
 }
