@@ -217,7 +217,7 @@ extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []T
 		if xml_ok {
 			append(&results, Tool_Call_Entry{
 				index = call_index,
-				id = fmt.tprintf("call_%d", call_index),
+				id = fmt.aprintf("call_%d", call_index),  // aprintf for persistent allocation
 				function = Tool_Call_Function{
 					name = name,
 					arguments = args,
@@ -237,7 +237,7 @@ extract_tool_calls :: proc(text: string) -> (clean_text: string, tool_calls: []T
 				}
 				append(&results, Tool_Call_Entry{
 					index = call_index,
-					id = fmt.tprintf("call_%d", call_index),
+					id = fmt.aprintf("call_%d", call_index),
 					function = Tool_Call_Function{
 						name = parsed.name,
 						arguments = args2,
